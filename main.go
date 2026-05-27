@@ -6,48 +6,44 @@ import (
 	"io"
 	"net"
 	"os"
-	"strings"
+	"strconv"
 )
 
+// main là entrypoint của chương trình.
+// Input: os.Args[1] để quyết định chạy server hay client.
+// Output: không return giá trị; nó start broker server hoặc chạy client gửi message.
+// Cần hàm này để gom logic chọn mode chạy từ command line.
 func main() {
-	if os.Args[1] == "server" {
+	switch os.Args[1] {
+	case "server":
+		fmt.Println("Trying to start broker process")
 		// Chạy broker TCP server
 		var broker = Broker{}
 		err := broker.startBrokerServer()
 		if err != nil {
 			fmt.Printf("Error starting broker: %v\n", err.Error())
 		}
-	} else {
+	case "producer":
+		fmt.Println("Trying to start producer process")
+		port, err := strconv.ParseInt(os.Args[2], 10, 16)
+		if err != nil {
+			panic(err)
+		}
+		var producer = Producer{}
+		err = producer.startProducerServer(int16(port))
+		if err != nil {
+			fmt.Printf("Error starting producer: %v\n", err.Error())
+		}
+	default:
 		// Chạy client và gửi message ECHO tới broker
 		clientConnectTCPAndEcho(BROKER_PORT)
 	}
 }
 
-func writeEchoToStream(streamRW *bufio.ReadWriter, data string) error {
-	var err error
-	// Protocol request: [length][type][data]
-	err = streamRW.WriteByte(byte(len(data) + 1))
-	if err != nil {
-		return err
-	}
-	// Type ECHO cho broker biết đây là message echo
-	err = streamRW.WriteByte(ECHO)
-	if err != nil {
-		return err
-	}
-	// Ghi nội dung message sau type
-	_, err = streamRW.WriteString(data)
-	if err != nil {
-		return err
-	}
-	// Đẩy toàn bộ buffer ra TCP connection
-	err = streamRW.Flush()
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
+// clientConnectTCPAndEcho tạo TCP client kết nối tới broker và gửi một ECHO message.
+// Input: port là cổng TCP của broker server.
+// Output: không return giá trị; nó in response từ broker ra terminal hoặc panic nếu read/write lỗi.
+// Cần hàm này để test luồng request-response giữa client và broker qua TCP.
 func clientConnectTCPAndEcho(port int) {
 	conn, _ := net.Dial("tcp", fmt.Sprintf(":%d", port))
 	fmt.Printf("Connected to server at port %v\n", port)
@@ -63,17 +59,17 @@ func clientConnectTCPAndEcho(port int) {
 			// panic here
 		}
 	}
-	fmt.Printf("Sent to server: %s\n", line)
-	writeEchoToStream(streamRW, strings.Trim(line, "\n"))
+	message := Message{ECHO: &line}
+	err = writeMessageToStream(streamRW, message)
+	if err != nil {
+		panic(err)
+	}
 
 	// Đọc response từ broker theo protocol: [length][data]
-	header, err := streamRW.ReadByte()
-	if header == 0 || err != nil {
-		return
+	resp, err := readMessageFromStream(streamRW)
+	if err != nil {
+		panic(err)
 	}
 	// Peek chỉ nhìn data, chưa bỏ khỏi buffer
-	data, _ := streamRW.Peek(int(header))
-	fmt.Printf("Receive message from server: %s\n", data)
-	// Bỏ response đã đọc ra khỏi buffer
-	streamRW.Discard(int(header))
+	fmt.Printf("Receive message from server: %s\n", *resp.R_ECHO)
 }
