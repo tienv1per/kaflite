@@ -94,12 +94,22 @@ func (b *Broker) processEchoMessage(message *string) (string, error) {
 	return fmt.Sprintf("I have receiver: %s", *message), nil
 }
 
+// processProducerRegisterMessage xử lý request đăng ký Producer với Broker.
+// Input: p_register_message là port Producer đang listen để Broker có thể dial ngược lại.
+// Output: trả byte response đăng ký thành công, hoặc error nếu port không hợp lệ.
+// Cần hàm này để sau bước register, Broker tạo goroutine riêng giữ connection với Producer và đọc nhiều message tiếp theo.
 func (b *Broker) processProducerRegisterMessage(p_register_message *string) (*byte, error) {
 	port, err := strconv.ParseInt(*p_register_message, 10, 16)
 	if err != nil {
 		return nil, err
 	}
+	// Tạo goroutine riêng cho Producer vừa register.
+	// Goroutine này capture port của Producer, dial vào đúng Producer đó,
+	// rồi giữ conn riêng để đọc mọi message Producer gửi về sau trên connection này.
 	go func() {
+		// conn này là TCP connection riêng giữa Broker goroutine này và Producer port tương ứng.
+		// Producer ghi message vào chính connection này, nên OS/TCP sẽ đưa bytes tới goroutine
+		// đang block ở readMessageFromStream bên dưới. Không cần router thủ công trong code.
 		conn, err := net.Dial("tcp", fmt.Sprintf(":%d", port))
 		if err != nil {
 			fmt.Printf("Error connecting to producer server at port %v: %v\n", port, err)
@@ -108,15 +118,18 @@ func (b *Broker) processProducerRegisterMessage(p_register_message *string) (*by
 		defer conn.Close()
 
 		fmt.Printf("Connected to producer server at port: %v\n", port)
-		// read input from stdin and write to stream
+		// streamRW bọc đúng conn riêng của Producer này.
+		// Read từ streamRW chỉ nhận data đi qua connection này, không lẫn với Producer khác.
 		streamRW := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 		for {
+			// Mỗi lần Producer gửi message tiếp theo trên cùng TCP connection,
+			// goroutine này sẽ được đánh thức để đọc frame [length][message_type][payload].
 			message, err := readMessageFromStream(streamRW)
 			if message == nil || err != nil {
 				fmt.Printf("Producer connection at port %v closed or invalid: %v\n", port, err)
 				return
 			}
-			// process something here
+			// Xử lý message đọc được từ đúng Producer đang gắn với goroutine này.
 			resp, err := b.processBrokerMessage(message)
 			if err != nil {
 				fmt.Printf("Error processing producer message from port %v: %v\n", port, err)

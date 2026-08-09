@@ -12,12 +12,13 @@ type Producer struct {
 }
 
 func (p *Producer) registerWithBroker(port int16) error {
+	// client connect tới TCP server đang listen ở port 10000
 	conn, err := net.Dial("tcp", fmt.Sprintf(":%d", BROKER_PORT))
 	if err != nil {
 		return fmt.Errorf("connect to broker: %w", err)
 	}
 	defer conn.Close()
-
+	// Buffer là vùng nhớ tạm dùng để giữ dữ liệu trước khi đọc hoặc ghi tiếp.
 	streamRW := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	port_str := fmt.Sprintf("%d", port)
 	message := Message{PRODUCER_REGISTER: &port_str}
@@ -51,12 +52,18 @@ func (p *Producer) startProducerServer(port int16) error {
 		return err
 	}
 
+	// Accept connection mà Broker dial ngược lại sau bước register.
+	// Từ đây về sau, mọi message stdin của Producer sẽ ghi vào conn này.
+	// Ở phía Broker, conn này đang được giữ bởi goroutine riêng cho Producer port này.
 	conn, err := listener.Accept()
 	if err != nil {
 		return fmt.Errorf("accept broker connection: %w", err)
 	}
 	defer conn.Close()
 
+	// streamRW bọc đúng connection riêng giữa Producer này và Broker goroutine tương ứng.
+	// Khi writeMessageToStream ghi vào streamRW, message sẽ đi qua TCP connection này
+	// và được đọc bởi readMessageFromStream trong goroutine riêng phía Broker.
 	streamRW := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -70,7 +77,8 @@ func (p *Producer) startProducerServer(port int16) error {
 				break
 			}
 		}
-		// write message to stream ECHO
+		// Gửi message lên đúng connection đã accept từ Broker.
+		// Vì Broker goroutine đang đọc trên cùng connection này, message sẽ vào đúng handler đó.
 		err = writeMessageToStream(streamRW, Message{ECHO: &line})
 		if err != nil {
 			return err
