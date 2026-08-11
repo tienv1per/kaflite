@@ -1,0 +1,11 @@
+package main
+
+type Topic struct {
+	topicID uint16
+	mq      Queue
+}
+
+func (t *Topic) init(topic_id uint16) {
+	t.topicID = topic_id
+	t.mq.init()
+}
