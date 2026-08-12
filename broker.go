@@ -4,12 +4,16 @@ import (
 	"bufio"
 	"fmt"
 	"net"
-	"strconv"
 )
 
 const BROKER_PORT = 10000
 
 type Broker struct {
+	topics []Topic
+}
+
+func (b *Broker) init() {
+	b.topics = make([]Topic, 0)
 }
 
 // startBrokerServer mở TCP listener và xử lý request từ client.
@@ -34,26 +38,22 @@ func (b *Broker) startBrokerServer() error {
 		// Đọc raw message từ TCP stream
 		message, err := readMessageFromStream(streamRW)
 		fmt.Println("Got some message from client...")
+		if message != nil || err != nil {
+			return err
+		}
+		// Xử lý message và tạo response
+		resp, err := b.processBrokerMessage(message)
 		if err != nil {
 			return err
 		}
-		if message != nil {
-			// Xử lý message và tạo response
-			resp, err := b.processBrokerMessage(message)
-			if err != nil {
-				fmt.Print("error1", err)
-				return err
-			}
-			if resp == nil {
-				_ = conn.Close()
-				continue
-			}
-			// Gửi response về client
-			err = writeMessageToStream(streamRW, *resp)
-			if err != nil {
-				fmt.Print("error2", err)
-				return err
-			}
+		if resp == nil {
+			_ = conn.Close()
+			continue
+		}
+		// Gửi response về client
+		err = writeMessageToStream(streamRW, *resp)
+		if err != nil {
+			return err
 		}
 		err = conn.Close()
 		if err != nil {
@@ -77,7 +77,7 @@ func (b *Broker) processBrokerMessage(message *Message) (*Message, error) {
 	}
 	if message.PRODUCER_REGISTER != nil {
 		// Echo response cho client
-		resp, err := b.processProducerRegisterMessage(message.PRODUCER_REGISTER)
+		resp, err := b.processProducerRegisterMessage(*message.PRODUCER_REGISTER)
 		if err != nil {
 			return nil, err
 		}
@@ -98,26 +98,37 @@ func (b *Broker) processEchoMessage(message *string) (string, error) {
 // Input: p_register_message là port Producer đang listen để Broker có thể dial ngược lại.
 // Output: trả byte response đăng ký thành công, hoặc error nếu port không hợp lệ.
 // Cần hàm này để sau bước register, Broker tạo goroutine riêng giữ connection với Producer và đọc nhiều message tiếp theo.
-func (b *Broker) processProducerRegisterMessage(p_register_message *string) (*byte, error) {
-	port, err := strconv.ParseInt(*p_register_message, 10, 16)
-	if err != nil {
-		return nil, err
-	}
+func (b *Broker) processProducerRegisterMessage(p_register_message ProducerRegisterMessage) (*byte, error) {
+	fmt.Printf("Broker received pRegMessage: port=%d, topicID=%d\n", p_register_message.port, p_register_message.topicID)
 	// Tạo goroutine riêng cho Producer vừa register.
 	// Goroutine này capture port của Producer, dial vào đúng Producer đó,
 	// rồi giữ conn riêng để đọc mọi message Producer gửi về sau trên connection này.
+	var topicIdx int = -1
+	for idx, topic := range b.topics {
+		if topic.topicID == p_register_message.topicID {
+			topicIdx = idx
+			break
+		}
+	}
+	if topicIdx == -1 {
+		topic := Topic{}
+		topic.init(p_register_message.topicID)
+		b.topics = append(b.topics, topic)
+		topicIdx = len(b.topics) - 1
+	}
+
 	go func() {
 		// conn này là TCP connection riêng giữa Broker goroutine này và Producer port tương ứng.
 		// Producer ghi message vào chính connection này, nên OS/TCP sẽ đưa bytes tới goroutine
 		// đang block ở readMessageFromStream bên dưới. Không cần router thủ công trong code.
-		conn, err := net.Dial("tcp", fmt.Sprintf(":%d", port))
+		conn, err := net.Dial("tcp", fmt.Sprintf(":%d", p_register_message.port))
 		if err != nil {
-			fmt.Printf("Error connecting to producer server at port %v: %v\n", port, err)
+			fmt.Printf("Error connecting to producer server at port %v: %v\n", p_register_message.port, err)
 			return
 		}
 		defer conn.Close()
 
-		fmt.Printf("Connected to producer server at port: %v\n", port)
+		fmt.Printf("Connected to producer server at port: %v\n", p_register_message.port)
 		// streamRW bọc đúng conn riêng của Producer này.
 		// Read từ streamRW chỉ nhận data đi qua connection này, không lẫn với Producer khác.
 		streamRW := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
@@ -126,26 +137,46 @@ func (b *Broker) processProducerRegisterMessage(p_register_message *string) (*by
 			// goroutine này sẽ được đánh thức để đọc frame [length][message_type][payload].
 			message, err := readMessageFromStream(streamRW)
 			if message == nil || err != nil {
-				fmt.Printf("Producer connection at port %v closed or invalid: %v\n", port, err)
+				fmt.Printf("Producer connection at port %v closed or invalid: %v\n", p_register_message.port, err)
 				return
+			}
+			// Nếu Producer gửi data message, Broker sẽ lưu message đó vào queue của topic
+			// mà Producer đã đăng ký trước đó. topicIdx được tìm/tạo ở bước register.
+			if message.PRODUCER_CONSUMER_MSG != nil {
+				// processProducerConsumerMessage push payload vào message queue của topic tương ứng.
+				resp, err := b.processProducerConsumerMessage(message.PRODUCER_CONSUMER_MSG, uint16(topicIdx))
+				if err != nil {
+					panic(err)
+				}
+				// Gửi ACK/status ngược lại để Producer biết Broker đã xử lý message này.
+				err = writeMessageToStream(streamRW, Message{R_PRODUCER_CONSUMER_MSG: &resp})
+				if err != nil {
+					panic(err)
+				}
 			}
 			// Xử lý message đọc được từ đúng Producer đang gắn với goroutine này.
 			resp, err := b.processBrokerMessage(message)
 			if err != nil {
-				fmt.Printf("Error processing producer message from port %v: %v\n", port, err)
+				fmt.Printf("Error processing producer message from port %v: %v\n", p_register_message.port, err)
 				return
 			}
 			if resp == nil {
-				fmt.Printf("Producer message from port %v has no response\n", port)
+				fmt.Printf("Producer message from port %v has no response\n", p_register_message.port)
 				continue
 			}
 			err = writeMessageToStream(streamRW, *resp)
 			if err != nil {
-				fmt.Printf("Error writing producer response to port %v: %v\n", port, err)
+				fmt.Printf("Error writing producer response to port %v: %v\n", p_register_message.port, err)
 				return
 			}
 		}
 	}()
 	var resp byte = 0
 	return &resp, nil
+}
+
+func (b *Broker) processProducerConsumerMessage(producer_consumer_msg []byte, topicIdx uint16) (byte, error) {
+	b.topics[topicIdx].mq.push(producer_consumer_msg)
+	b.topics[topicIdx].mq.debug()
+	return 0, nil
 }

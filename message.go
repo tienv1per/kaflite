@@ -1,63 +1,109 @@
 package main
 
-import "bufio"
+import (
+	"bufio"
+	"fmt"
+)
 
 const (
-	ECHO              = 1
-	PRODUCER_REGISTER = 2
+	ECHO                  = 1
+	PRODUCER_REGISTER     = 2
+	PRODUCER_CONSUMER_MSG = 3
 	// response
-	R_ECHO              = 101
-	R_PRODUCER_REGISTER = 102
+	R_ECHO                  = 101
+	R_PRODUCER_REGISTER     = 102
+	R_PRODUCER_CONSUMER_MSG = 103
 	// other message types
 )
 
 type Message struct {
 	// Nếu ECHO != nil thì message này là echo request
-	ECHO                *string
-	PRODUCER_REGISTER   *string
-	R_ECHO              *string
-	R_PRODUCER_REGISTER *byte
+	ECHO                    *string
+	PRODUCER_REGISTER       *ProducerRegisterMessage
+	PRODUCER_CONSUMER_MSG   []byte // nullable
+	R_ECHO                  *string
+	R_PRODUCER_REGISTER     *byte
+	R_PRODUCER_CONSUMER_MSG *byte
+}
+
+type ProducerRegisterMessage struct {
+	port    uint16
+	topicID uint16
+}
+
+// fromByte decode payload đăng ký Producer từ bytes vào ProducerRegisterMessage.
+// Input: stream_message phải có 4 bytes theo format [port cao][port thấp][topicID cao][topicID thấp].
+// Output: không return; receiver m được cập nhật port và topicID.
+// Ví dụ: []byte{0x27, 0x10, 0x00, 0x02} sẽ thành port=10000 và topicID=2.
+func (m *ProducerRegisterMessage) fromByte(stream_message []byte) {
+	// Payload có tổng cộng 4 bytes:
+	// - 2 bytes đầu: producer port
+	// - 2 bytes sau: topic ID
+	// Mỗi uint16 dùng big-endian: byte cao đứng trước, byte thấp đứng sau.
+	m.port = uint16(stream_message[0])<<8 + uint16(stream_message[1])
+	m.topicID = uint16(stream_message[2])<<8 + uint16(stream_message[3])
+}
+
+// toByte encode ProducerRegisterMessage thành payload bytes để gửi qua TCP.
+// Input: receiver m chứa port và topicID cần gửi.
+// Output: trả về []byte dài 4 theo format [port cao][port thấp][topicID cao][topicID thấp].
+// Ví dụ: port=10000 (0x2710), topicID=2 sẽ thành []byte{0x27, 0x10, 0x00, 0x02}.
+func (m *ProducerRegisterMessage) toByte() []byte {
+	// Encode ProducerRegisterMessage thành payload 4 bytes mà fromByte đọc được:
+	// [port cao][port thấp][topicID cao][topicID thấp].
+	var data = make([]byte, 4)
+	data[0] = byte(m.port >> 8)
+	data[1] = byte(m.port % 256)
+	data[2] = byte(m.topicID >> 8)
+	data[3] = byte(m.topicID % 256)
+	return data
 }
 
 // readFromStream đọc một frame thô từ TCP stream theo format [length][data].
-// Input: stream_rw là buffered reader/writer đang bọc TCP connection.
+// Input: streamRW là buffered reader/writer đang bọc TCP connection.
 // Output: trả về data bytes sau length header, hoặc error nếu stream lỗi/thiếu bytes.
 // Cần hàm này để tách phần framing TCP khỏi phần parse message business-level.
-func readFromStream(stream_rw *bufio.ReadWriter) ([]byte, error) {
+func readFromStream(streamRW *bufio.ReadWriter) ([]byte, error) {
 	var err error
 	// Protocol: [length][data]
-	header, err := stream_rw.ReadByte()
+	header, err := streamRW.ReadByte() // block
 	if err != nil {
 		return nil, err
 	}
 	// Đọc đúng số byte mà header báo
-	data, err := stream_rw.Peek(int(header))
+	data, err := streamRW.Peek(int(header)) // block
 	if err != nil {
 		return nil, err
 	}
 	// Bỏ data đã đọc ra khỏi buffer
-	_, err = stream_rw.Discard(int(header))
+	_, err = streamRW.Discard(int(header))
 	return data, err
 }
 
 // parseMessage chuyển raw bytes trong frame thành struct Message.
-// Input: stream_message có format [message_type][payload].
+// Input: streamMessage có format [message_type][payload].
 // Output: Message với field tương ứng được set, hoặc nil nếu type chưa hỗ trợ.
 // Cần hàm này để broker/client làm việc với struct rõ nghĩa thay vì xử lý byte thủ công.
-func parseMessage(stream_message []byte) *Message {
-	switch stream_message[0] {
+func parseMessage(streamMessage []byte) *Message {
+	switch streamMessage[0] {
 	case ECHO:
-		var st = string(stream_message[1:])
+		var st = string(streamMessage[1:])
 		return &Message{ECHO: &st}
 	case R_ECHO:
-		var st = string(stream_message[1:])
+		var st = string(streamMessage[1:])
 		return &Message{R_ECHO: &st}
 	case PRODUCER_REGISTER:
-		var st = string(stream_message[1:])
-		return &Message{PRODUCER_REGISTER: &st}
+		p := ProducerRegisterMessage{}
+		p.fromByte(streamMessage[1:])
+		return &Message{PRODUCER_REGISTER: &p}
 	case R_PRODUCER_REGISTER:
-		var st = stream_message[1]
+		var st = streamMessage[1]
 		return &Message{R_PRODUCER_REGISTER: &st}
+	case PRODUCER_CONSUMER_MSG:
+		return &Message{PRODUCER_CONSUMER_MSG: streamMessage[1:]}
+	case R_PRODUCER_CONSUMER_MSG:
+		var st = streamMessage[1]
+		return &Message{R_PRODUCER_CONSUMER_MSG: &st}
 	default:
 		return nil
 	}
@@ -119,13 +165,25 @@ func writeMessageToStream(streamRW *bufio.ReadWriter, message Message) error {
 		}
 	}
 	if message.PRODUCER_REGISTER != nil {
-		if err := writeToStreamWithType(streamRW, PRODUCER_REGISTER, *message.PRODUCER_REGISTER); err != nil {
+		data := string(message.PRODUCER_REGISTER.toByte())
+		if err := writeToStreamWithType(streamRW, PRODUCER_REGISTER, data); err != nil {
 			return err
 		}
 	}
 	if message.R_PRODUCER_REGISTER != nil {
-		data := string(*message.R_PRODUCER_REGISTER)
+		data := fmt.Sprintf("%d", *message.R_PRODUCER_REGISTER)
 		if err := writeToStreamWithType(streamRW, R_PRODUCER_REGISTER, data); err != nil {
+			return err
+		}
+	}
+	if message.PRODUCER_CONSUMER_MSG != nil {
+		if err := writeToStreamWithType(streamRW, PRODUCER_CONSUMER_MSG, string(message.PRODUCER_CONSUMER_MSG)); err != nil {
+			return err
+		}
+	}
+	if message.R_PRODUCER_CONSUMER_MSG != nil {
+		data := fmt.Sprintf("%d", *message.R_PRODUCER_CONSUMER_MSG)
+		if err := writeToStreamWithType(streamRW, R_PRODUCER_CONSUMER_MSG, data); err != nil {
 			return err
 		}
 	}

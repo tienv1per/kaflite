@@ -19,6 +19,7 @@ func main() {
 		fmt.Println("Trying to start broker process")
 		// Chạy broker TCP server
 		var broker = Broker{}
+		broker.init()
 		err := broker.startBrokerServer()
 		if err != nil {
 			fmt.Printf("Error starting broker: %v\n", err.Error())
@@ -29,8 +30,15 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		var producer = Producer{}
-		err = producer.startProducerServer(int16(port))
+		topicID, err := strconv.ParseInt(os.Args[3], 10, 16)
+		if err != nil {
+			panic(err)
+		}
+		var producer = Producer{
+			port:    uint16(port),
+			topicID: uint16(topicID),
+		}
+		err = producer.startProducerServer()
 		if err != nil {
 			fmt.Printf("Error starting producer: %v\n", err.Error())
 		}

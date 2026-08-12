@@ -9,9 +9,11 @@ import (
 )
 
 type Producer struct {
+	port    uint16
+	topicID uint16
 }
 
-func (p *Producer) registerWithBroker(port int16) error {
+func (p *Producer) sendPortDataToBroker() error {
 	// client connect tới TCP server đang listen ở port 10000
 	conn, err := net.Dial("tcp", fmt.Sprintf(":%d", BROKER_PORT))
 	if err != nil {
@@ -20,11 +22,17 @@ func (p *Producer) registerWithBroker(port int16) error {
 	defer conn.Close()
 	// Buffer là vùng nhớ tạm dùng để giữ dữ liệu trước khi đọc hoặc ghi tiếp.
 	streamRW := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
-	port_str := fmt.Sprintf("%d", port)
-	message := Message{PRODUCER_REGISTER: &port_str}
+	pRegMsg := ProducerRegisterMessage{
+		port:    p.port,
+		topicID: p.topicID,
+	}
+	fmt.Printf("pRegMsg: port=%d, topicID=%d\n", pRegMsg.port, pRegMsg.topicID)
+	message := Message{
+		PRODUCER_REGISTER: &pRegMsg,
+	}
 	err = writeMessageToStream(streamRW, message)
 	if err != nil {
-		return fmt.Errorf("send producer register: %w", err)
+		return fmt.Errorf("send producer register error: %w", err)
 	}
 	// try to read back from the stream
 	resp, err := readMessageFromStream(streamRW)
@@ -34,20 +42,21 @@ func (p *Producer) registerWithBroker(port int16) error {
 	if resp == nil || resp.R_PRODUCER_REGISTER == nil {
 		return fmt.Errorf("broker returned invalid producer register response")
 	}
-	fmt.Printf("Received response from Broker: %d\n", *resp.R_PRODUCER_REGISTER)
+	fmt.Printf("Received response from Broker: %v\n", *resp.R_PRODUCER_REGISTER)
 	return nil
 }
 
-func (p *Producer) startProducerServer(port int16) error {
+func (p *Producer) startProducerServer() error {
+	var err error
 	// Mở producer server trước để broker có thể dial ngược lại sau khi register.
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", p.port))
 	if err != nil {
-		return fmt.Errorf("start producer server: %w", err)
+		return fmt.Errorf("start producer server error: %w", err)
 	}
 	defer listener.Close()
 
 	// Connect to Broker to send register
-	err = p.registerWithBroker(port)
+	err = p.sendPortDataToBroker()
 	if err != nil {
 		return err
 	}
@@ -79,7 +88,7 @@ func (p *Producer) startProducerServer(port int16) error {
 		}
 		// Gửi message lên đúng connection đã accept từ Broker.
 		// Vì Broker goroutine đang đọc trên cùng connection này, message sẽ vào đúng handler đó.
-		err = writeMessageToStream(streamRW, Message{ECHO: &line})
+		err = writeMessageToStream(streamRW, Message{PRODUCER_CONSUMER_MSG: []byte(line)})
 		if err != nil {
 			return err
 		}
@@ -88,7 +97,7 @@ func (p *Producer) startProducerServer(port int16) error {
 		if err != nil {
 			break
 		}
-		fmt.Printf("Received message from broker: %s\n", *resp.R_ECHO)
+		fmt.Printf("Received message from broker: %d\n", *resp.R_PRODUCER_CONSUMER_MSG)
 	}
 	err = conn.Close()
 	if err != nil {
