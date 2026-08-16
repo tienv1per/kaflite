@@ -10,11 +10,11 @@ import (
 const BROKER_PORT = 10000
 
 type Broker struct {
-	topics []Topic
+	topics []*Topic
 }
 
 func (b *Broker) init() {
-	b.topics = make([]Topic, 0)
+	b.topics = make([]*Topic, 0)
 }
 
 // startBrokerServer mở TCP listener và xử lý request từ client.
@@ -111,19 +111,19 @@ func (b *Broker) processProducerRegisterMessage(p_register_message ProducerRegis
 	// Tạo goroutine riêng cho Producer vừa register.
 	// Goroutine này capture port của Producer, dial vào đúng Producer đó,
 	// rồi giữ conn riêng để đọc mọi message Producer gửi về sau trên connection này.
-	var topicIdx int = -1
-	for idx, topic := range b.topics {
-		if topic.topicID == p_register_message.topicID {
-			topicIdx = idx
+	var topic *Topic
+	for _, tp := range b.topics {
+		if tp.topicID == p_register_message.topicID {
+			topic = tp
 			break
 		}
 	}
-	if topicIdx == -1 {
-		topic := Topic{}
-		topic.init(p_register_message.topicID)
-		b.topics = append(b.topics, topic)
-		topicIdx = len(b.topics) - 1
-		go b.stopAndPop(uint(topicIdx))
+	if topic == nil {
+		tp := &Topic{}
+		tp.init(p_register_message.topicID)
+		b.topics = append(b.topics, tp)
+		topic = tp
+		go b.stopAndPop(topic)
 	}
 
 	go func() {
@@ -153,7 +153,7 @@ func (b *Broker) processProducerRegisterMessage(p_register_message ProducerRegis
 			// mà Producer đã đăng ký trước đó. topicIdx được tìm/tạo ở bước register.
 			if message.PRODUCER_CONSUMER_MSG != nil {
 				// processProducerConsumerMessage push payload vào message queue của topic tương ứng.
-				resp, err := b.processProducerConsumerMessage(message.PRODUCER_CONSUMER_MSG, uint16(topicIdx))
+				resp, err := b.processProducerConsumerMessage(message.PRODUCER_CONSUMER_MSG, topic)
 				if err != nil {
 					panic(err)
 				}
@@ -169,9 +169,9 @@ func (b *Broker) processProducerRegisterMessage(p_register_message ProducerRegis
 	return &resp, nil
 }
 
-func (b *Broker) processProducerConsumerMessage(producer_consumer_msg []byte, topicIdx uint16) (byte, error) {
-	b.topics[topicIdx].mq.push(producer_consumer_msg)
-	b.topics[topicIdx].mq.debug()
+func (b *Broker) processProducerConsumerMessage(producer_consumer_msg []byte, topic *Topic) (byte, error) {
+	topic.mq.push(producer_consumer_msg)
+	topic.mq.debug()
 	return 0, nil
 }
 
@@ -182,46 +182,42 @@ func (b *Broker) processProducerConsumerMessage(producer_consumer_msg []byte, to
 func (b *Broker) processConsumerRegisterMessage(cRegMessage ConsumerRegisterMessage) (*byte, error) {
 	fmt.Printf("Broker received cRegMessage: port=%d, topicID=%d, groupID=%d\n", cRegMessage.port, cRegMessage.topicID, cRegMessage.groupID)
 	// Tìm hoặc tạo topic mà Consumer muốn đọc.
-	var topicIdx int = -1
+	var topic *Topic
 	for _, tp := range b.topics {
 		if tp.topicID == cRegMessage.topicID {
-			topicIdx = int(tp.topicID)
+			topic = tp
 			break
 		}
 	}
 
-	if topicIdx == -1 {
+	if topic == nil {
 		// Topic mới cần init để có queue riêng và danh sách consumer group rỗng.
-		topic := Topic{}
-		topic.init(cRegMessage.topicID)
-		b.topics = append(b.topics, topic)
-		topicIdx = len(b.topics) - 1
+		tp := &Topic{}
+		tp.init(cRegMessage.topicID)
+		b.topics = append(b.topics, tp)
+		topic = tp
 	}
 
 	// Tìm hoặc tạo consumer group trong topic; mỗi group có offset đọc riêng.
 	// Hai group khác nhau có thể đọc cùng topic ở hai tốc độ khác nhau.
-	var groupIdx int = -1
-	for idx, cgroup := range b.topics[topicIdx].cgroups {
-		if cgroup.groupID == cRegMessage.groupID {
-			groupIdx = idx
+	var cgroup *CGroup
+	for _, cg := range topic.cgroups {
+		if cg.groupID == cRegMessage.groupID {
+			cgroup = cg
 			break
 		}
 	}
 
-	if groupIdx == -1 {
-		// Group mới bắt đầu từ offset 0, tức là đọc từ message đầu tiên của topic queue.
-		cgroup := CGroup{
+	if cgroup == nil {
+		cg := &CGroup{
 			groupID: cRegMessage.groupID,
 			offset:  0,
 		}
-		b.topics[topicIdx].cgroups = append(b.topics[topicIdx].cgroups, cgroup)
-		groupIdx = len(b.topics[topicIdx].cgroups) - 1
-
-		// Start consumption loop một lần cho consumer group mới.
-		// Các Consumer đăng ký thêm cùng group sẽ dùng chung loop này.
-		// Hiện tại design là 1 consumer group có 1 goroutine đọc queue theo offset của group,
-		// chưa phải mỗi ConsumerConn chạy trong một goroutine riêng.
-		go b.startConsumerGroupConsumption(uint(topicIdx), uint(groupIdx))
+		topic.lock.Lock()
+		topic.cgroups = append(topic.cgroups, cg)
+		topic.lock.Unlock()
+		cgroup = cg
+		go b.startConsumerGroupConsumption(topic, cgroup)
 	}
 
 	// Dial tới Consumer port và lưu connection để Broker có thể push message về Consumer.
@@ -238,9 +234,7 @@ func (b *Broker) processConsumerRegisterMessage(cRegMessage ConsumerRegisterMess
 		conn:   conn,
 	}
 
-	// Gắn connection này vào đúng group; một group có thể có nhiều ConsumerConn.
-	// Consumption loop của group sẽ duyệt danh sách này để tìm Consumer đang ready.
-	b.topics[topicIdx].cgroups[groupIdx].consumers = append(b.topics[topicIdx].cgroups[groupIdx].consumers, consumer)
+	cgroup.consumers = append(cgroup.consumers, consumer)
 	var resp byte = 0
 	return &resp, nil
 }
@@ -250,25 +244,25 @@ func (b *Broker) processConsumerRegisterMessage(cRegMessage ConsumerRegisterMess
 // Output: không return; goroutine này chạy liên tục cho tới khi process dừng.
 // Cần hàm này để mỗi consumer group đọc topic queue theo offset riêng mà không pop queue chung.
 // Hiện tại goroutine nằm ở cấp consumer group; từng ConsumerConn chỉ là connection được loop này dùng để gửi data.
-func (b *Broker) startConsumerGroupConsumption(topicIdx uint, cgroupIdx uint) {
-	fmt.Printf("Starting consumer group consumption for topic %d and group %d\n", topicIdx, cgroupIdx)
+func (b *Broker) startConsumerGroupConsumption(topic *Topic, cgroup *CGroup) {
+	fmt.Printf("Starting consumer group consumption for topic %d and group %d\n", topic.topicID, cgroup.groupID)
 	for {
-		b.topics[topicIdx].cgroups[cgroupIdx].lock.Lock()
+		cgroup.lock.Lock()
 		// Mỗi vòng loop thử lấy message tiếp theo cho group này.
 		// offset thuộc về consumer group, không thuộc về topic queue.
-		offset := b.topics[topicIdx].cgroups[cgroupIdx].offset
+		offset := cgroup.offset
 
 		// peek đọc message tại offset của group mà không pop khỏi topic queue.
 		// Nhờ vậy group khác vẫn có thể đọc cùng message nếu offset của họ chưa vượt qua nó.
-		pcm := b.topics[topicIdx].mq.peek(offset)
+		pcm := topic.mq.peek(offset)
 		if pcm == nil {
-			time.Sleep(100 * time.Millisecond)
-			b.topics[topicIdx].cgroups[cgroupIdx].lock.Unlock()
+			cgroup.lock.Unlock()
 			continue
 		}
 
 		// Gửi message cho consumer đang ready, rồi chờ ACK trước khi bật ready lại.
-		for _, consumer := range b.topics[topicIdx].cgroups[cgroupIdx].consumers {
+		for i := range cgroup.consumers {
+			consumer := &cgroup.consumers[i]
 			if consumer.status {
 				// Tạo stream reader/writer trên connection riêng của Consumer hiện tại.
 				streamRW := bufio.NewReadWriter(bufio.NewReader(consumer.conn), bufio.NewWriter(consumer.conn))
@@ -282,7 +276,7 @@ func (b *Broker) startConsumerGroupConsumption(topicIdx uint, cgroupIdx uint) {
 				}
 
 				// Đọc ACK/status từ Consumer sau khi Consumer xử lý message.
-				parsedMessage, err := readMessageFromStream(streamRW)
+				parsedMessage, err := readMessageFromStream(streamRW) // wait forever for consumer
 
 				// TODO: ACK handling đang là bản nháp; điều kiện này cần hoàn thiện cùng Consumer.
 				if parsedMessage == nil || err != nil {
@@ -294,13 +288,12 @@ func (b *Broker) startConsumerGroupConsumption(topicIdx uint, cgroupIdx uint) {
 				if parsedMessage.R_PRODUCER_CONSUMER_MSG != nil {
 					consumer.status = true
 				}
-				// increased offset on consumer
-				b.topics[topicIdx].cgroups[cgroupIdx].offset += 1
+				cgroup.offset += 1
 			} else {
-				fmt.Printf("No consumer is ready, size = %d\n", len(b.topics[topicIdx].cgroups[cgroupIdx].consumers))
+				fmt.Printf("No consumer is ready, size = %d\n", len(cgroup.consumers))
 			}
 		}
-		b.topics[topicIdx].cgroups[cgroupIdx].lock.Unlock()
+		cgroup.lock.Unlock()
 	}
 }
 
@@ -308,12 +301,13 @@ func (b *Broker) startConsumerGroupConsumption(topicIdx uint, cgroupIdx uint) {
 // Input: topicIdx là index của topic cần cleanup.
 // Output: không return; goroutine này chạy nền và kiểm tra cleanup mỗi 5 giây.
 // Cần hàm này để topic queue không giữ mãi các message mà mọi consumer group đã đọc xong.
-func (b *Broker) stopAndPop(topicIdx uint) {
+func (b *Broker) stopAndPop(topic *Topic) {
 	for {
 		time.Sleep(5 * time.Second)
+		topic.lock.Lock()
 		// minOffset là offset nhỏ nhất trong tất cả consumer group của topic.
 		minOffset := -1
-		for _, cgroup := range b.topics[topicIdx].cgroups {
+		for _, cgroup := range topic.cgroups {
 			if minOffset == -1 {
 				minOffset = int(cgroup.offset)
 			} else if int(cgroup.offset) < minOffset {
@@ -322,18 +316,19 @@ func (b *Broker) stopAndPop(topicIdx uint) {
 		}
 		fmt.Printf("Stop and pop run, minOffset = %d\n", minOffset)
 		if minOffset != -1 {
-			for i, _ := range b.topics[topicIdx].cgroups {
-				b.topics[topicIdx].cgroups[i].lock.Lock()
-				b.topics[topicIdx].cgroups[i].offset -= uint(minOffset)
+			for i, _ := range topic.cgroups {
+				topic.cgroups[i].lock.Lock()
+				topic.cgroups[i].offset -= uint(minOffset)
 			}
 			// pop minOffset message khỏi đầu queue vì tất cả group đã consume qua các message đó.
 			for minOffset > 0 {
-				b.topics[topicIdx].mq.pop()
+				topic.mq.pop()
 				minOffset -= 1
 			}
-			for i, _ := range b.topics[topicIdx].cgroups {
-				b.topics[topicIdx].cgroups[i].lock.Unlock()
+			for i, _ := range topic.cgroups {
+				topic.cgroups[i].lock.Unlock()
 			}
 		}
+		topic.lock.Unlock()
 	}
 }
