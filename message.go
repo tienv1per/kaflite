@@ -9,10 +9,12 @@ const (
 	ECHO                  = 1
 	PRODUCER_REGISTER     = 2
 	PRODUCER_CONSUMER_MSG = 3
+	CONSUMER_REGISTER     = 4
 	// response
 	R_ECHO                  = 101
 	R_PRODUCER_REGISTER     = 102
 	R_PRODUCER_CONSUMER_MSG = 103
+	R_CONSUMER_REGISTER     = 104
 	// other message types
 )
 
@@ -21,14 +23,22 @@ type Message struct {
 	ECHO                    *string
 	PRODUCER_REGISTER       *ProducerRegisterMessage
 	PRODUCER_CONSUMER_MSG   []byte // nullable
+	CONSUMER_REGISTER       *ConsumerRegisterMessage
 	R_ECHO                  *string
 	R_PRODUCER_REGISTER     *byte
 	R_PRODUCER_CONSUMER_MSG *byte
+	R_CONSUMER_REGISTER     *byte
 }
 
 type ProducerRegisterMessage struct {
 	port    uint16
 	topicID uint16
+}
+
+type ConsumerRegisterMessage struct {
+	port    uint16
+	topicID uint16
+	groupID uint16
 }
 
 // fromByte decode payload đăng ký Producer từ bytes vào ProducerRegisterMessage.
@@ -56,6 +66,30 @@ func (m *ProducerRegisterMessage) toByte() []byte {
 	data[1] = byte(m.port % 256)
 	data[2] = byte(m.topicID >> 8)
 	data[3] = byte(m.topicID % 256)
+	return data
+}
+
+func (m *ConsumerRegisterMessage) fromByte(stream_message []byte) {
+	// Payload có tổng cộng 4 bytes:
+	// - 2 bytes đầu: consumer port
+	// - 2 bytes sau: topic ID
+	// - 2 bytes sau: group ID
+	// Mỗi uint16 dùng big-endian: byte cao đứng trước, byte thấp đứng sau.
+	m.port = uint16(stream_message[0])<<8 + uint16(stream_message[1])
+	m.topicID = uint16(stream_message[2])<<8 + uint16(stream_message[3])
+	m.groupID = uint16(stream_message[4])<<8 + uint16(stream_message[5])
+}
+
+func (m *ConsumerRegisterMessage) toByte() []byte {
+	// Encode ConsumerRegisterMessage thành payload 6 bytes mà fromByte đọc được:
+	// [port cao][port thấp][topicID cao][topicID thấp][groupID cao][groupID thấp]
+	var data = make([]byte, 6)
+	data[0] = byte(m.port >> 8)
+	data[1] = byte(m.port % 256)
+	data[2] = byte(m.topicID >> 8)
+	data[3] = byte(m.topicID % 256)
+	data[4] = byte(m.groupID >> 8)
+	data[5] = byte(m.groupID % 256)
 	return data
 }
 
@@ -104,6 +138,13 @@ func parseMessage(streamMessage []byte) *Message {
 	case R_PRODUCER_CONSUMER_MSG:
 		var st = streamMessage[1]
 		return &Message{R_PRODUCER_CONSUMER_MSG: &st}
+	case CONSUMER_REGISTER:
+		p := ConsumerRegisterMessage{}
+		p.fromByte(streamMessage[1:])
+		return &Message{CONSUMER_REGISTER: &p}
+	case R_CONSUMER_REGISTER:
+		var st = streamMessage[1]
+		return &Message{R_CONSUMER_REGISTER: &st}
 	default:
 		return nil
 	}
@@ -173,6 +214,18 @@ func writeMessageToStream(streamRW *bufio.ReadWriter, message Message) error {
 	if message.R_PRODUCER_REGISTER != nil {
 		data := fmt.Sprintf("%d", *message.R_PRODUCER_REGISTER)
 		if err := writeToStreamWithType(streamRW, R_PRODUCER_REGISTER, data); err != nil {
+			return err
+		}
+	}
+	if message.CONSUMER_REGISTER != nil {
+		data := string(message.CONSUMER_REGISTER.toByte())
+		if err := writeToStreamWithType(streamRW, CONSUMER_REGISTER, data); err != nil {
+			return err
+		}
+	}
+	if message.R_CONSUMER_REGISTER != nil {
+		data := fmt.Sprintf("%d", *message.R_CONSUMER_REGISTER)
+		if err := writeToStreamWithType(streamRW, R_CONSUMER_REGISTER, data); err != nil {
 			return err
 		}
 	}

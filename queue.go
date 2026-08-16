@@ -36,6 +36,9 @@ func (q *Queue) push(data []byte) {
 // Output: trả về slice trỏ vào underArr với đúng length đã lưu trong underSize.
 // Cần hàm này để lấy lại message thật thay vì đọc cả slot cố định 255 bytes.
 func (q *Queue) pop() []byte {
+	if q.head == q.tail {
+		return nil
+	}
 	data := underArr[q.head : q.head+uint32(underSize[q.head])]
 	q.head += maxMessageSize
 	q.head %= maxMessageSize * queueCapacity
@@ -47,11 +50,35 @@ func (q *Queue) debug() {
 	var cur = q.head
 	for {
 		data := underArr[cur : cur+uint32(underSize[cur])]
-		fmt.Printf("%s\n", data)
+		fmt.Printf("%s", data)
 		cur += maxMessageSize
 		cur %= maxMessageSize * queueCapacity
 		if cur >= q.tail {
 			break
 		}
 	}
+}
+
+// peek đọc message tại offset tính từ q.head mà không thay đổi trạng thái queue.
+// Mỗi message nằm trong một slot cố định maxMessageSize byte, nên offset logic
+// được đổi thành byte position bằng q.head + offset*maxMessageSize.
+// Nếu position vượt cuối backing array, phép modulo sẽ wrap về đầu ring buffer.
+// underSize[position] lưu độ dài thật của message trong slot đó, nên hàm chỉ
+// trả về đúng phần data thật thay vì toàn bộ slot maxMessageSize byte.
+func (q *Queue) peek(offset uint) []byte {
+	if q.head == q.tail {
+		return nil
+	}
+	position := q.head + uint32(offset*maxMessageSize)
+	position %= maxMessageSize * queueCapacity
+	if q.head < q.tail {
+		if !(position >= q.head && position < q.tail) {
+			return nil
+		}
+	} else {
+		if !(position >= q.head || position < q.tail) {
+			return nil
+		}
+	}
+	return underArr[position : position+uint32(underSize[position])]
 }

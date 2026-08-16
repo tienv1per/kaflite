@@ -42,6 +42,29 @@ func main() {
 		if err != nil {
 			fmt.Printf("Error starting producer: %v\n", err.Error())
 		}
+	case "consumer":
+		fmt.Println("Trying to start consumer process")
+		port, err := strconv.ParseInt(os.Args[2], 10, 16)
+		if err != nil {
+			panic(err)
+		}
+		topicID, err := strconv.ParseInt(os.Args[3], 10, 16)
+		if err != nil {
+			panic(err)
+		}
+		groupID, err := strconv.ParseInt(os.Args[4], 10, 16)
+		if err != nil {
+			panic(err)
+		}
+		var consumer = Consumer{
+			port:    uint16(port),
+			topicID: uint16(topicID),
+			groupID: uint16(groupID),
+		}
+		err = consumer.startConsumerServer()
+		if err != nil {
+			fmt.Printf("Error starting consumer: %v\n", err.Error())
+		}
 	default:
 		// Chạy client và gửi message ECHO tới broker
 		clientConnectTCPAndEcho(BROKER_PORT)
